@@ -1,0 +1,132 @@
+/* Escalera sonora: maqueta de 8 peldanos con descanso.
+ * UNO R3 + DFPlayer Mini. No usar para orientar transito real.
+ * Biblioteca adicional: DFRobotDFPlayerMini (DFRobot).
+ * Los cinco MP3 deben grabarse y copiarse a /mp3/0001.mp3 ... 0005.mp3.
+ */
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include "ControlRecorrido.h"
+
+const uint8_t B1 = 2, B2 = 3, S0 = 4, S1 = 5, S2 = 6, BUSY = 7;
+const uint8_t MP3_RX = 10, MP3_TX = 11;
+// Confirmar en banco: para los sensores previstos, LOW indica haz cortado.
+// Si el modulo utilizado informa haz cortado en HIGH, cambiar a HIGH.
+const uint8_t HAZ_CORTADO = LOW;
+const uint8_t BUSY_REPRODUCIENDO = LOW;
+const uint8_t VOLUMEN = 18; // escala DFPlayer 0...30; ajustar al entorno
+const uint32_t ARRANQUE_AUDIO_MS = 2000UL, MAX_AUDIO_MS = 30000UL;
+
+SoftwareSerial puertoMp3(MP3_RX, MP3_TX);
+DFRobotDFPlayerMini reproductor;
+ControlRecorrido control;
+
+struct Entrada {
+  uint8_t pin, estable, anterior, crudo;
+  uint16_t filtro;
+  uint32_t cambio;
+  void iniciar(uint8_t p, uint8_t modo, uint16_t ms) {
+    pin = p; filtro = ms; pinMode(pin, modo);
+    estable = anterior = crudo = digitalRead(pin); cambio = millis();
+  }
+  void actualizar(uint32_t ahora) {
+    anterior = estable;
+    uint8_t valor = digitalRead(pin);
+    if (valor != crudo) { crudo = valor; cambio = ahora; }
+    if (uint32_t(ahora-cambio) >= filtro) estable = crudo;
+  }
+  bool flanco(uint8_t valor) const { return estable == valor && anterior != valor; }
+};
+Entrada botones[2], sensores[3], ocupado;
+bool audioActivo = false, busyVisto = false;
+uint8_t pistaActual = 0;
+uint32_t inicioAudio = 0;
+
+void detenerAudio() {
+  reproductor.stop(); audioActivo = false; busyVisto = false; pistaActual = 0;
+}
+void declararFallo(const __FlashStringHelper* motivo) {
+  detenerAudio(); control.fallo(); digitalWrite(LED_BUILTIN, HIGH);
+  Serial.print(F("FALLO: ")); Serial.println(motivo);
+  Serial.println(F("Revisar microSD, BUSY y alimentacion. Reiniciar para reintentar."));
+}
+
+void actualizarAudio(uint32_t ahora) {
+  if (audioActivo) {
+    if (ocupado.estable == BUSY_REPRODUCIENDO) busyVisto = true;
+    if (!busyVisto && uint32_t(ahora-inicioAudio) > ARRANQUE_AUDIO_MS) {
+      declararFallo(F("El audio no confirmo arranque por BUSY")); return;
+    }
+    if (uint32_t(ahora-inicioAudio) > MAX_AUDIO_MS) {
+      declararFallo(F("Audio demasiado largo o BUSY bloqueado")); return;
+    }
+    if (busyVisto && ocupado.estable != BUSY_REPRODUCIENDO) {
+      uint8_t terminada = pistaActual;
+      audioActivo = false; pistaActual = 0;
+      control.audioTerminado(terminada);
+    }
+  }
+  if (!audioActivo && control.activo()) {
+    uint8_t siguiente = control.extraer();
+    if (siguiente) {
+      pistaActual = siguiente; inicioAudio = ahora;
+      busyVisto = false; audioActivo = true;
+      reproductor.playMp3Folder(siguiente);
+      Serial.print(F("Pista: ")); Serial.println(siguiente);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  botones[0].iniciar(B1, INPUT_PULLUP, 35);
+  botones[1].iniciar(B2, INPUT_PULLUP, 35);
+  // Resistencias externas de 10 kOhm a +5V, segun el esquema.
+  sensores[0].iniciar(S0, INPUT, 15);
+  sensores[1].iniciar(S1, INPUT, 15);
+  sensores[2].iniciar(S2, INPUT, 15);
+  ocupado.iniciar(BUSY, INPUT, 100);
+  puertoMp3.begin(9600);
+  delay(1500); // estabilizacion inicial del modulo, solo al encender
+  if (!reproductor.begin(puertoMp3, false, true)) {
+    control.fallo(); digitalWrite(LED_BUILTIN, HIGH);
+    Serial.println(F("No se pudo inicializar el DFPlayer. Revisar conexiones y SD."));
+    return;
+  }
+  reproductor.volume(VOLUMEN);
+  delay(150);
+  reproductor.stop();
+  Serial.println(F("Listo. Liberar sensores. B1=subir, B2=bajar."));
+}
+
+void loop() {
+  uint32_t ahora = millis();
+  for (uint8_t i=0; i<2; ++i) botones[i].actualizar(ahora);
+  for (uint8_t i=0; i<3; ++i) sensores[i].actualizar(ahora);
+  ocupado.actualizar(ahora);
+  if (control.sentido == ControlRecorrido::FALLO) return;
+  if (control.vencio(ahora)) {
+    detenerAudio(); Serial.println(F("Reinicio por inactividad, sin anunciar llegada."));
+    return;
+  }
+  if (control.sentido == ControlRecorrido::ESPERA) {
+    bool subir = botones[0].flanco(LOW), bajar = botones[1].flanco(LOW);
+    // Pulsaciones simultaneas se descartan.
+    if (subir != bajar) {
+      uint8_t destino = subir ? 2 : 0;
+      bool aceptado = control.iniciar(subir ? ControlRecorrido::SUBIDA : ControlRecorrido::BAJADA,
+          ahora, sensores[1].estable != HAZ_CORTADO,
+          sensores[destino].estable != HAZ_CORTADO);
+      if (!aceptado) Serial.println(F("Liberar descanso y destino; luego pulsar otra vez."));
+    }
+  } else {
+    // Procesar primero S1 conserva el orden si dos sensores cambian en el mismo ciclo.
+    if (sensores[1].flanco(HAZ_CORTADO)) control.sensor(1, ahora);
+    uint8_t destino = control.sentido == ControlRecorrido::SUBIDA ? 2 : 0;
+    if (sensores[destino].flanco(HAZ_CORTADO)) control.sensor(destino, ahora);
+    uint8_t origen = control.sentido == ControlRecorrido::SUBIDA ? 0 : 1;
+    if (botones[origen].flanco(LOW)) control.repetir(ahora, !audioActivo);
+  }
+  actualizarAudio(ahora);
+}
